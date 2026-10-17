@@ -71,8 +71,9 @@ final class ResolutionService: @unchecked Sendable {
     /// Restores the pre-sleep mode if macOS brought the display back on a different one; skips
     /// rather than forces a fallback when the exact size no longer exists. (w18z)
     /// See docs/display-notes.md (ResolutionService).
-    /// Returns nil when no restore is attempted, or the result of an attempted restore.
-    func restoreModeAfterWakeIfNeeded(for displayID: CGDirectDisplayID) async -> Bool? {
+    /// Returns the detached restore task, or nil when no restore is attempted.
+    @discardableResult
+    func restoreModeAfterWakeIfNeeded(for displayID: CGDirectDisplayID) -> Task<Bool, Never>? {
         // A mirrored beyond-cap size (#65) belongs to MirroredModeService to restore, not us.
         guard !MirroredModeService.shared.isActive(for: displayID) else { return nil }
         guard let snapshot = sleepModes, let key = Self.uuidKey(for: displayID),
@@ -105,9 +106,11 @@ final class ResolutionService: @unchecked Sendable {
 
         let now = CGDisplayCopyDisplayMode(displayID)
         Self.log.notice("display \(displayID, privacy: .public): came back from sleep on \(now?.width ?? 0, privacy: .public)x\(now?.height ?? 0, privacy: .public), restoring the pre-sleep \(saved.width, privacy: .public)x\(saved.height, privacy: .public) @\(Int(saved.refresh), privacy: .public)")
-        let ok = await Self.applyModeSync(cgMode, on: targetID)
-        Self.log.notice("display \(displayID, privacy: .public): mode restore after wake \(ok ? "ok" : "failed", privacy: .public)")
-        return ok
+        return Task.detached(priority: .userInitiated) {
+            let ok = await ResolutionService.applyModeSync(cgMode, on: targetID)
+            ResolutionService.log.notice("display \(displayID, privacy: .public): mode restore after wake \(ok ? "ok" : "failed", privacy: .public)")
+            return ok
+        }
     }
 
     // MARK: - Query

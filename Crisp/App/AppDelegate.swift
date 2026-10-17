@@ -135,21 +135,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             BrightnessBoostService.shared.reapplyAll()
         }
 
-        // Restore a color mode explicitly chosen in Crisp on a fresh launch too.
-        // Delay one second to let the initial display and WindowServer mode lists settle.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self else { return }
-            self.displayManager.refreshDisplays()
-            var restored = false
-            for display in self.displayManager.displays {
-                if DisplayColorModeService.shared.restoreSavedModeIfNeeded(for: display) {
-                    restored = true
-                }
-            }
-            if restored {
-                NotificationCenter.default.post(name: .crispDisplayColorModeNeedsRefresh, object: nil)
-            }
-        }
+        DisplayColorModeService.shared.restoreAtLaunchIfNeeded(using: displayManager)
 
         // Record every display's mode as the screens go down, so the wake passes
         // below can put back what macOS moved and nothing else. Both notifications:
@@ -311,35 +297,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 // WindowServer keeps settling for seconds after wake: ICC restore and
                 // link retraining can clobber a freshly applied transfer table (#25).
                 // Three passes with increasing delays; services reapply state as needed.
-                var restoredColorModeUUIDs: Set<String> = []
                 for delay: UInt64 in [0, 4_000_000_000, 8_000_000_000] {
                     try? await Task.sleep(nanoseconds: delay)
-                    var colorModeChangeRequested = false
                     for display in dm.displays {
                         // Apply software brightness factor first so GammaService
                         // can read the up-to-date factor when it re-applies its formula.
                         BrightnessService.shared.reapplySoftwareBrightnessIfNeeded(for: display)
                         GammaService.shared.reapplyIfNeeded(for: display)
                         // Re-apply any custom resolution that macOS may have reset on wake
-                        let resolutionRestored = await ResolutionService.shared.restoreModeAfterWakeIfNeeded(
-                            for: display.displayID
-                        )
-                        if resolutionRestored == true {
-                            // Let the new timing appear in WindowServer before reading
-                            // its compatible color formats.
-                            try? await Task.sleep(nanoseconds: 250_000_000)
-                        }
-                        // Skip color after a failed or timed-out resolution request;
-                        // try again on the next wake pass.
-                        if resolutionRestored != false,
-                           !restoredColorModeUUIDs.contains(display.displayUUID),
-                           DisplayColorModeService.shared.restoreSavedModeIfNeeded(for: display) {
-                            restoredColorModeUUIDs.insert(display.displayUUID)
-                            colorModeChangeRequested = true
-                        }
+                        DisplayColorModeService.shared.restoreAfterWakeIfNeeded(for: display)
                     }
-                    if colorModeChangeRequested { try? await Task.sleep(nanoseconds: 250_000_000) }
-                    NotificationCenter.default.post(name: .crispDisplayColorModeNeedsRefresh, object: nil)
                     // Once an external is back after a full wake, toggle True Tone so macOS
                     // recomputes it with that display present (issue #131). Once per wake,
                     // at the first pass that lists an external.
@@ -599,21 +566,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let dm = displayManager
         let state = sectionState
         let settings = SettingsService.shared
-        func host<V: View>(_ id: String, @ViewBuilder _ content: () -> V) -> NSView {
-            let h = CountedHostingView(rootView: AnyView(
-                BlockHost(onHeight: { [weak self] h in self?.canvas.contentChanged(id, height: h) }) {
-                    content()
-                }
-                .environmentObject(dm)
-            ))
-            // Blocks near the window's edges otherwise get a phantom safe-area
-            // inset, misplacing clicks. See docs/panel-resize.md (failure map #9).
-            h.safeAreaRegions = []
-            return h
-        }
         func block<V: View>(_ id: String, isOpen: @escaping () -> Bool = { true },
                             @ViewBuilder _ content: () -> V) -> PanelBlock {
-            PanelBlock(id: id, host: host(id, content), isOpen: isOpen)
+            PanelBlock(id: id, host: hostPanelBlock(id, content), isOpen: isOpen)
         }
 
         var blocks: [PanelBlock] = []
@@ -708,9 +663,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             })
         }
         blocks.append(block("reconnect") { ReconnectDisplaysSection() })
-        let visCount = vis.count
         blocks.append(block("combined",
-                            isOpen: { settings.showCombinedBrightness && visCount > 1 }) {
+                            isOpen: { settings.showCombinedBrightness && vis.count > 1 }) {
             VStack(spacing: 0) {
                 SectionDivider()
                 CombinedBrightnessView(displays: vis)
@@ -1051,6 +1005,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 // MARK: - Panel window
 
 extension AppDelegate {
+    private func hostPanelBlock<V: View>(_ id: String, @ViewBuilder _ content: () -> V) -> NSView {
+        let h = CountedHostingView(rootView: AnyView(
+            BlockHost(onHeight: { [weak self] h in self?.canvas.contentChanged(id, height: h) }) {
+                content()
+            }
+            .environmentObject(displayManager)
+        ))
+        // Blocks near the window's edges otherwise get a phantom safe-area
+        // inset, misplacing clicks. See docs/panel-resize.md (failure map #9).
+        h.safeAreaRegions = []
+        return h
+    }
+
     private func makePanel() -> MenuPanel {
         let p = MenuPanel(
             contentRect: .zero,
